@@ -1,0 +1,354 @@
+using System.Collections;
+using UnityEngine; using UnityEngine.Audio;
+using UnityEngine.InputSystem;
+using NaughtyAttributes;
+using Interactions = UnityEngine.InputSystem.Interactions;
+
+public class PlayerScript : MonoBehaviour
+{
+	public float damagePercent;
+
+	[HorizontalLine(color: EColor.Red, height: 10)][Header("Components")] public Rigidbody rb; public Animator animator; public Collider hitBox; public AudioSource audioSource; public Collider hurtBox;
+	public PhysicsMaterial normalMaterial; public PhysicsMaterial bounceMaterial;
+	
+	[HorizontalLine(color: EColor.Red, height: 10)][Header("Ground Check")] public LayerMask groundLayers; public float groundCheckRadius; public Transform groundCheck; 
+	bool isIgnoringPlatforms = false;
+
+	[HorizontalLine(color: EColor.Red, height: 10)][Header("Ledge Grabbing")] public LayerMask ledgeLayers; public float ledgeGrabRadius; public Transform ledgeCheck; 
+	private bool holdingLedge;
+
+	[HorizontalLine(color: EColor.Red, height: 10)][Header("Other Stats")] public int weight; public float gravityScale; public float fastFallSpeed; bool usingFastFall; public GameObject fastFallEffect;
+
+	[HorizontalLine(color: EColor.Red, height: 10)][Header("Ground Movement Stats")] public float groundWalkSpeed; public float groundAccelSpeed; public float groundDecelSpeed;
+
+	[HorizontalLine(color: EColor.Red, height: 10)][Header("Initial Dash Stats")] public float initialDashForce; public float initialDashCooldown;
+	bool hasInitialDash = true;
+
+	[HorizontalLine(color: EColor.Red, height: 10)][Header("Air Movement Stats")] public float airMoveSpeed; public float airAccelSpeed; public float airDecelSpeed;
+
+	[HorizontalLine(color: EColor.Red, height: 10)] [Header("Jumping")] public float jumpHeight; public int maxJumps; 
+	[HorizontalLine(color: EColor.Yellow, height: 5)] public AudioClip[] jumpNoise; public Vector2 jumpNoiseChance;
+	[HorizontalLine(color: EColor.Yellow, height: 5)] public GameObject jumpEffect;
+	int jumps;
+
+	[HorizontalLine(color: EColor.Red, height: 10)][Header("Shielding")] public GameObject shield; public float maxShieldHealth; public float shieldSizeMult;public float shieldChargeRate;public float shieldDrainRate;
+	bool isShielding; float shieldHealth;	
+
+	[HorizontalLine(color: EColor.Red, height: 10)][Header("Grabbing")] public Transform holdPoint; public PlayerScript heldPlayer;
+
+	[HorizontalLine(color: EColor.Red, height: 10)][Header("Throws")] public AttackDataSO forwardThrow;public AttackDataSO backThrow;public AttackDataSO upThrow; public AttackDataSO downThrow;
+
+	[HorizontalLine(color: EColor.Red, height: 10)][Header("Dodging")]  public float dodgeCooldown; public float groundDodgeDistance; public float groundDodgeDuration; public float airDodgeDistance; public float airDodgeDuration;
+	float currentDodgeCooldown; float dodgeDistance; float dodgeDuration;
+	
+	[HorizontalLine(color: EColor.Red, height: 10)][Header("Initial Dashing")]
+	bool pressedInitDash = true; float currentDashCooldown;
+
+	//operation vars
+	bool isGrounded; bool pressedJump; Vector2 moveVelocity; float hitStunDuration;float moveSpeed; float accelSpeed; float decelSpeed; float invincibilityFrames; Vector2 moveInput; Vector3 size;
+
+	[HorizontalLine(color: EColor.Red, height: 10)][Header("Graphics and Sound")]
+	public GameObject launchEffect; public GameObject runEffect; public GameObject onHitEffect; public AudioClip[] hurtSound;
+
+	[HorizontalLine(color: EColor.Red, height: 10)][Header("Specials")]
+	public GameObject fireBall; public float fireBallSpeed; bool hasUpSpecial;
+
+	[HorizontalLine(color: EColor.Red, height: 10)][Header("Controls")] public InputAction directionControls;public InputAction leftRightControl;public InputAction jumpControl;public InputAction attackButton;public InputAction specialButton;public InputAction shieldButton; public InputAction powerAttackButton;
+	
+
+	void OnDrawGizmos() { Gizmos.color = Color.red; Gizmos.DrawWireSphere(groundCheck.position, groundCheckRadius); Gizmos.DrawWireSphere(ledgeCheck.position, ledgeGrabRadius);}
+
+	void Start()
+	{
+		shieldHealth = maxShieldHealth; rb.mass = weight;Physics.IgnoreCollision(GetComponent<CapsuleCollider>(), hitBox);
+		directionControls.Enable(); jumpControl.Enable();attackButton.Enable();specialButton.Enable();shieldButton.Enable(); powerAttackButton.Enable();
+		leftRightControl.performed += OnLeftRightPress; leftRightControl.Enable(); 
+	}
+
+	void OnLeftRightPress(InputAction.CallbackContext context){ if (context.interaction is Interactions.MultiTapInteraction && hasInitialDash && isGrounded){ hasInitialDash = false; pressedInitDash = true; currentDashCooldown = initialDashCooldown; }} 
+
+	bool IsGrounded() { return Physics.CheckSphere(groundCheck.position, groundCheckRadius, groundLayers) && rb.linearVelocity.y <= 0.01f;}
+	public float Dir() { return transform.localScale.x > 0 ? 1:-1;}
+	bool IsAttacking() { return animator.GetCurrentAnimatorStateInfo(0).IsTag("Attack") || animator.GetCurrentAnimatorStateInfo(0).IsTag("Lock Attack"); }
+	bool IsAttackLockMovement() { return animator.GetCurrentAnimatorStateInfo(0).IsTag("Lock Attack"); }
+	bool IsInvincible() { return invincibilityFrames > 0; }
+	public bool IsInHitStun(){ return hitStunDuration > 0; }
+
+	void Update(){ moveInput = directionControls.ReadValue<Vector2>(); size = transform.localScale;
+		UpdateAnimator(); UpdateMoveStats();
+
+		//up to jump, down to drop through platforms
+		if(jumpControl.WasPressedThisFrame()){pressedJump = true;} if(IsAttacking()){ pressedJump = false; }
+		if(moveInput.y < 0){ if(!isIgnoringPlatforms && !IsAttackLockMovement()) {StartCoroutine(IgnoreSemiSolids()); holdingLedge = false;}}
+
+		if(moveInput.x != 0 && isGrounded && !IsAttacking()){CheckTurnaround();}
+
+		shield.SetActive(shieldButton.IsPressed() && isGrounded && !IsAttacking() && !IsInHitStun());
+
+		runEffect.SetActive(Mathf.Abs(rb.linearVelocity.x) == moveSpeed && isGrounded);
+
+		if(!holdingLedge && !IsInHitStun() && !isIgnoringPlatforms && !isGrounded){	
+			Collider[] nearLedge = Physics.OverlapSphere(ledgeCheck.position, ledgeGrabRadius, ledgeLayers);
+			if(nearLedge.Length > 0){
+				Vector3 ledgePos = nearLedge[0].transform.position; 
+				CapsuleCollider capsule = GetComponent<CapsuleCollider>();
+				bool ledgeIsToRight = ledgePos.x > transform.position.x;
+				float targetX = ledgeIsToRight ? (ledgePos.x - capsule.radius) : (ledgePos.x + capsule.radius);
+				if (ledgeIsToRight){transform.localScale = new Vector3(Mathf.Abs(size.x), size.y, size.z);} 
+				else { transform.localScale = new Vector3(-Mathf.Abs(size.x), size.y, size.z);}
+				transform.position = new Vector3(targetX, ledgePos.y - (capsule.height / 4f), transform.position.z); 
+				holdingLedge = true;
+			}
+		}
+
+		if(!IsInHitStun()) {CheckForAttacks();}
+	}
+	public void UpdateAnimator(){ animator.SetBool("holdingPlayer", heldPlayer != null); animator.SetBool("isInHitstun", IsInHitStun()); animator.SetBool("isRunning", Mathf.Abs(rb.linearVelocity.x) > 0); animator.SetBool("isGrounded", isGrounded); animator.SetBool("isShielding", shield.activeSelf && isGrounded); }
+	public void UpdateMoveStats() {	
+		if(isGrounded){ moveSpeed = groundWalkSpeed; accelSpeed = groundAccelSpeed; decelSpeed = groundDecelSpeed; dodgeDistance = groundDodgeDistance; dodgeDuration = groundDodgeDuration; } 
+		else{ moveSpeed = airMoveSpeed; accelSpeed = airAccelSpeed; decelSpeed = airDecelSpeed; dodgeDistance = airDodgeDistance; dodgeDuration = airDodgeDuration; } 
+	}
+	public void CheckForAttacks(){
+		if(powerAttackButton.IsPressed() && isGrounded && !IsAttacking()){
+			switch(moveInput){				
+				case Vector2 _ when shield.activeSelf: Grab(); break;
+
+				case Vector2 d when d == Vector2.zero: animator.Play("Forward Smash"); break;
+
+				case Vector2 d when Mathf.Abs(d.x) > d.y && d.y >= 0: animator.Play("Forward Smash"); break;
+				
+				case Vector2 d when d.y < 0 && d.y < Mathf.Abs(d.x): animator.Play("Down Smash"); break;
+
+				case Vector2 d when d.y > Mathf.Abs(d.x): animator.Play("Up Smash"); break;
+
+				default: animator.Play("Forward Smash"); break;
+			}
+		}
+		if(attackButton.WasPressedThisFrame() && !IsAttacking()){ 
+			if(isGrounded)
+			{			
+				switch(moveInput)
+				{
+					case Vector2 _ when shield.activeSelf: Grab(); break;
+
+					case Vector2 d when d == Vector2.zero: animator.Play("Neutral Attack"); break;
+
+					case Vector2 d when Mathf.Abs(d.x) > d.y && d.y >= 0: animator.Play("Forward Attack"); break;
+				
+					case Vector2 d when d.y < 0 && d.y < Mathf.Abs(d.x): animator.Play("Down Attack"); break;
+
+					case Vector2 d when d.y > Mathf.Abs(d.x): animator.Play("Up Attack"); break;
+
+					default: animator.Play("Up Attack"); break;
+				}
+			}
+			else
+			{
+				switch(moveInput)
+				{
+					case Vector2 d when d == Vector2.zero: animator.Play("Neutral Air"); break;
+
+					case Vector2 d when Mathf.Abs(d.x) > Mathf.Abs(d.y)  && (d.x * Dir()) > 0: animator.Play("Forward Air"); break;
+					
+					case Vector2 d when Mathf.Abs(d.x) > Mathf.Abs(d.y) && (d.x * Dir()) < 0: animator.Play("Back Air");break;
+				
+					case Vector2 d when d.y < 0 && d.y < Mathf.Abs(d.x):animator.Play("Down Air");break;
+
+					case Vector2 d when d.y > Mathf.Abs(d.x):animator.Play("Up Air");break;
+
+					default: 
+						Debug.Log("man idk");
+						//animator.Play("mixamo_com");
+					break;
+				}
+			}
+		}
+		if(specialButton.WasPressedThisFrame() && !IsAttacking()){
+			switch(moveInput){				
+				case Vector2 _ when shield.activeSelf: Grab(); break;
+
+				case Vector2 d when d == Vector2.zero: NeutralSpecial(); break;
+
+				case Vector2 d when Mathf.Abs(d.x) > d.y && d.y >= 0: SideSpecial(); break;
+				
+				case Vector2 d when d.y < 0 && d.y < Mathf.Abs(d.x): DownSpecial(); break;
+
+				case Vector2 d when d.y > Mathf.Abs(d.x): UpSpecial(); break;
+
+				default: SideSpecial(); break;
+			}
+		}
+	}
+		public void NeutralSpecial(){
+			animator.Play("Neutral Special");
+			GameObject newFireball = Instantiate(fireBall, new Vector3(transform.position.x + 0.5f * Dir(), transform.position.y, transform.position.z), transform.rotation);
+			newFireball.GetComponent<Rigidbody>().AddForce(new Vector3(1, 0.5f, 0) * fireBallSpeed * Dir(), ForceMode.Impulse); newFireball.GetComponentInChildren<AttackData>().player = this;
+		}
+		public void SideSpecial(){
+			animator.Play("Side Special");
+			if (moveInput.x > 0) { transform.localScale = new Vector3(Mathf.Abs(size.x), size.y, size.z); }
+			else{transform.localScale = new Vector3(-Mathf.Abs(size.x), size.y, size.z);}
+			rb.linearVelocity = new Vector2(rb.linearVelocity.x, 0f);
+			rb.AddForce(transform.right * Dir() * jumpHeight * rb.mass * 0.5f, ForceMode.Impulse);
+			if(!isIgnoringPlatforms){StartCoroutine(IgnoreSemiSolids());} holdingLedge = false;
+		}
+		public void UpSpecial(){
+			if(hasUpSpecial){
+				animator.Play("Up Special"); hasUpSpecial = false;
+				rb.linearVelocity = new Vector2(rb.linearVelocity.x, 0f);
+				rb.AddForce(transform.up * jumpHeight * rb.mass * 1.35f, ForceMode.Impulse);
+				if(!isIgnoringPlatforms){StartCoroutine(IgnoreSemiSolids());} holdingLedge = false;
+			}
+		}
+		public void DownSpecial(){
+			animator.Play("Down Special");
+		}
+		public void Grab(){
+			animator.Play("Grab");
+			StartCoroutine(GrabRoutine());
+		}
+		IEnumerator GrabRoutine(){
+			yield return new WaitUntil(() => IsAttacking());
+			yield return new WaitWhile(() => IsAttacking()); yield return null;
+			if(heldPlayer != null){
+				yield return new WaitUntil(() => directionControls.IsPressed() || !heldPlayer.IsInHitStun()); 
+				if (heldPlayer == null) { yield break; } if(!heldPlayer.IsInHitStun()){heldPlayer = null; yield break;}
+				switch(moveInput)
+					{
+						case Vector2 d when Mathf.Abs(d.x) > Mathf.Abs(d.y)  && (d.x * Dir()) > 0: ThrowWithData(forwardThrow); break;
+						case Vector2 d when Mathf.Abs(d.x) > Mathf.Abs(d.y) && (d.x * Dir()) < 0: transform.localScale = new Vector3(transform.localScale.x * -1f, transform.localScale.y, transform.localScale.z); heldPlayer.transform.position = holdPoint.position; yield return new WaitForSeconds(0.1f); ThrowWithData(backThrow); break;
+						case Vector2 d when d.y < 0 && d.y < Mathf.Abs(d.x):ThrowWithData(downThrow);break;
+						case Vector2 d when d.y > Mathf.Abs(d.x): animator.Play("Up Attack"); ThrowWithData(upThrow);break;
+						default: ThrowWithData(forwardThrow); break;
+					}
+					heldPlayer = null; yield break;
+			}
+			else{ Debug.Log("player was not grabbed when grab anim end"); yield break;}
+		}
+		public void ThrowWithData(AttackDataSO atkData)
+		{
+			heldPlayer.TakeKnockback(
+				new Vector2(atkData.hitDir.x * Dir(), atkData.hitDir.y),
+				atkData.baseKnockback + (atkData.knockbackGrowth * damagePercent),
+				atkData.baseDamage,
+				atkData.baseHitstun * (atkData.hitstunGrowth * damagePercent),
+				true,
+				true
+				);
+		}
+
+	public void CheckTurnaround(){
+			if (moveInput.x > 0) { transform.localScale = new Vector3(Mathf.Abs(size.x), size.y, size.z); }
+			else{transform.localScale = new Vector3(-Mathf.Abs(size.x), size.y, size.z);}
+	}
+
+	IEnumerator IgnoreSemiSolids(){
+		isIgnoringPlatforms = true; this.GetComponent<Collider>().excludeLayers = LayerMask.GetMask("Semi-Solid"); yield return new WaitForFixedUpdate();
+	
+		CapsuleCollider capsule = GetComponent<CapsuleCollider>(); Vector3 point1 = Vector3.zero; Vector3 point2 = Vector3.zero; float worldRadius = 0f;
+		void RecalculateCapsule()
+		{
+			float maxRadiusScale = Mathf.Max(Mathf.Abs(transform.lossyScale.x), Mathf.Abs(transform.lossyScale.z)); worldRadius = capsule.radius * maxRadiusScale;
+			float worldHeight = capsule.height * Mathf.Abs(transform.lossyScale.y); Vector3 worldCenter = transform.TransformPoint(capsule.center); float worldOffset = Mathf.Max(0f, (worldHeight * 0.5f) - worldRadius);
+			point1 = worldCenter + transform.up * worldOffset; point2 = worldCenter - transform.up * worldOffset;
+		}RecalculateCapsule(); 
+		while (rb.linearVelocity.y > 0.05f || Physics.CheckCapsule(point1, point2, worldRadius, groundLayers)  ||IsInHitStun()) { yield return new WaitForFixedUpdate(); RecalculateCapsule(); } yield return new WaitUntil(() => { return !Physics.CheckSphere(ledgeCheck.position, ledgeGrabRadius, ledgeLayers);});
+		yield return new WaitForSeconds(0.1f); this.GetComponent<Collider>().excludeLayers = 0; isIgnoringPlatforms = false;
+	}
+
+	void OnTriggerEnter(Collider hit){
+		if (hit.transform.CompareTag("Hitbox"))
+		{
+			AttackData hitInfo = hit.GetComponent<AttackData>();
+			if (hitInfo == null) return;
+
+			Vector2 calculatedDir = new Vector2(hitInfo.hitDir.x * hitInfo.player.Dir(), hitInfo.hitDir.y);
+			float calculatedKnockback = hitInfo.baseKnockback + (hitInfo.knockbackGrowth * damagePercent);
+			float calculatedHitstun = hitInfo.baseHitstun + (hitInfo.hitstunGrowth * damagePercent);
+
+			switch (hitInfo)
+			{
+				case var _ when hitInfo.isGrab:
+					TakeKnockback(calculatedDir, calculatedKnockback, hitInfo.baseDamage, calculatedHitstun, true, false); 
+					hitInfo.player.heldPlayer = this;
+					break;
+            
+				case var _ when shield != null && shield.activeSelf:
+					shieldHealth -= hitInfo.baseDamage;
+					break;
+
+				case var _ when !IsInvincible():  
+					TakeKnockback(calculatedDir, calculatedKnockback, hitInfo.baseDamage, calculatedHitstun, hitInfo.isDrag, true);
+				break;
+			}
+		}
+	}
+
+	public void Stagger(){ animator.Play("Stagger");}
+	public void TakeKnockback(Vector2 hitDirection, float force, float damage, float hitStun, bool canPlaySound, bool ignoreSemis){
+		damagePercent += damage;
+		hitStunDuration = Mathf.Clamp(hitStun, 0, 2);
+		rb.linearVelocity = Vector2.zero;
+		hurtBox.sharedMaterial = bounceMaterial;
+		rb.AddForce(hitDirection * force, ForceMode.Impulse);
+		hasUpSpecial = true;
+		Instantiate(onHitEffect, transform.position, transform.rotation);
+		if (!isIgnoringPlatforms && ignoreSemis) { StartCoroutine(IgnoreSemiSolids()); }
+		if(canPlaySound){ audioSource.PlayOneShot(hurtSound[Random.Range(0, hurtSound.Length)]);}
+	}
+
+	void FixedUpdate() //KEEP THIS ORDER OF CODE LINES!!!
+	{ moveInput = directionControls.ReadValue<Vector2>(); isGrounded = IsGrounded(); if(IsInvincible()){invincibilityFrames -= Time.fixedDeltaTime; } if(currentDodgeCooldown > 0){ currentDodgeCooldown -= Time.fixedDeltaTime; }
+
+		if(IsAttackLockMovement()){float atkMoveLock = Mathf.MoveTowards(rb.linearVelocity.x, 0, decelSpeed * Time.fixedDeltaTime); rb.linearVelocity = new Vector2(atkMoveLock, rb.linearVelocity.y); DoGravity(); return;}	
+		DoJump();
+		if(isGrounded || holdingLedge){jumps = maxJumps; hasUpSpecial = true; }
+		if (holdingLedge) { if(IsInHitStun()){ holdingLedge = false; } else{rb.linearVelocity = Vector3.zero;}  return;}
+		//Code to use the shield, cannot be moved to function since it needs to break the FixedUpdate() loop 
+		if (shield.activeSelf) {
+			shieldHealth -= shieldDrainRate; if(shieldHealth <= 1){ shieldHealth = 0; Stagger(); } 
+			float shieldPctSize = shieldHealth / maxShieldHealth * shieldSizeMult; shield.transform.localScale = new Vector3(shieldPctSize, shieldPctSize, shieldPctSize);
+			float shieldDecel = Mathf.MoveTowards(rb.linearVelocity.x, 0, decelSpeed * Time.fixedDeltaTime); rb.linearVelocity = new Vector2(shieldDecel, rb.linearVelocity.y);
+			if(moveInput.x != 0f && currentDodgeCooldown <= 0.01f){ StartCoroutine(DirectionalDodge()); } if(shieldHealth >= 1) {invincibilityFrames = 0.05f;}			
+			return;
+		} else if (shieldHealth < maxShieldHealth){ shieldHealth += shieldChargeRate;} 
+		if(shieldButton.IsPressed() && currentDodgeCooldown <= 0.01f && !isGrounded && !IsInHitStun() && !IsAttacking()){ StartCoroutine(DirectionalDodge());}
+		DoGravity();		
+		if (IsInHitStun()){ hitStunDuration -= Time.fixedDeltaTime; return; } else {hurtBox.sharedMaterial = normalMaterial; }
+		if(currentDashCooldown > 0){ currentDashCooldown -= Time.fixedDeltaTime; } else { hasInitialDash = true;}
+		if(pressedInitDash){ rb.AddForce(transform.right * initialDashForce * weight * Dir(), ForceMode.Impulse); pressedInitDash = false;} 
+		MoveCharacter();
+	}
+	public void DoGravity(){ 
+			if(!isGrounded && !usingFastFall && moveInput.y < 0) {
+				usingFastFall = true; Instantiate(fastFallEffect, new Vector3(transform.position.x, transform.position.y - 0.5f, transform.position.z), transform.rotation, transform); 
+				rb.linearVelocity = new Vector2(rb.linearVelocity.x, 0f); rb.AddForce(-transform.up * weight * fastFallSpeed * 2, ForceMode.Impulse);
+			} 
+			Vector3 gravity = Physics.gravity * (usingFastFall ? gravityScale : fastFallSpeed); rb.AddForce(gravity, ForceMode.Acceleration); 
+	}
+	public void DoJump(){
+		if(pressedJump && jumps >= 1 && !IsAttacking() && !IsInHitStun()){
+			jumps -= 1; rb.linearVelocity = new Vector2(rb.linearVelocity.x, 0f); animator.Play("Jump");
+			rb.AddForce(transform.up * jumpHeight * rb.mass, ForceMode.Impulse); pressedJump = false;
+			Instantiate(jumpEffect, groundCheck.position, transform.rotation); if(Random.Range(1, Mathf.RoundToInt(jumpNoiseChance.y) + 1) <= jumpNoiseChance.x){ audioSource.PlayOneShot(jumpNoise[Random.Range(0, jumpNoise.Length)]);} 
+			if(!isIgnoringPlatforms){StartCoroutine(IgnoreSemiSolids());} holdingLedge = false; usingFastFall = false;
+		} 		
+		else{pressedJump = false;}
+	}
+	public void MoveCharacter(){
+		float targetSpeed = moveInput.x * moveSpeed;
+		float currentAccel = (Mathf.Abs(targetSpeed) > 0.01f) ? accelSpeed : decelSpeed;
+		float newX = Mathf.MoveTowards(rb.linearVelocity.x, targetSpeed, currentAccel * Time.fixedDeltaTime);
+		rb.linearVelocity = new Vector2(newX, rb.linearVelocity.y);
+	}
+
+	IEnumerator DirectionalDodge()
+	{
+		currentDodgeCooldown = dodgeCooldown;
+		invincibilityFrames = dodgeDuration;
+		animator.Play("Dodge");
+        rb.AddForce(transform.right * moveInput * dodgeDistance * weight, ForceMode.Impulse);
+		yield return new WaitForSeconds(dodgeDuration);
+		rb.linearVelocity = new Vector3(0, 0, 0);
+	}
+}
